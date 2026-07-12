@@ -1,0 +1,8 @@
+websockets
+dotenv
+pydantic
+firecrawl
+google
+google.genai
+ollama
+mcp

@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: artist-tools
+Version: 0.1.0
+Summary: Audience analytics tools for music data
+Author: Baon
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: websockets
+Requires-Dist: dotenv
+Requires-Dist: pydantic
+Requires-Dist: firecrawl
+Requires-Dist: google
+Requires-Dist: google.genai
+Requires-Dist: ollama
+Requires-Dist: mcp
