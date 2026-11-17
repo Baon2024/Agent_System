@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { supabase } from "../supabase/supabase.js";
 import { get_user_location } from "../frontendTools/tools.js";
 import { HumanInLoopModal } from "../components/modal.jsx";
+import AskFurtherInformation from "../components/AskFurtherInformation.jsx";
 
 const functionUI = {
   read_todo: "📝",
@@ -72,6 +73,7 @@ useEffect(() => {
       let messageType = eventParsed.message_type;
       let toolCallRequest = eventParsed?.tool_call_request
       let requestId = eventParsed?.request_id
+      let humanInputRequest = eventParsed?.human_input_request
 
       if (messageType === "client_side_tool_call") {
         console.log("frontend_tool_call recieved: ", eventParsed);
@@ -83,16 +85,16 @@ useEffect(() => {
         const chosenTool = clientSideTools[toolName];
         if (!chosenTool) {
           // need to handle tool not being found or existing
-          sendClientToolMessage(agentId, null, frontendToolCallId, true, "chosen tool did not exist in frontend" )
+          return sendClientToolMessage(agentId, null, frontendToolCallId, true, "chosen tool did not exist in frontend - must not be a frontend tool" )
         }
         try {
         const result = await chosenTool(args);
         console.log("result from frontend tool call is: ", result);
         
-        sendClientToolMessage(agentId, result, frontendToolCallId, false, null)
+        return sendClientToolMessage(agentId, result, frontendToolCallId, false, null)
 
         } catch(e) {
-           sendClientToolMessage(agentId, null, frontendToolCallId, true, String(e) )
+           return sendClientToolMessage(agentId, null, frontendToolCallId, true, String(e) )
         }
 
         // then return outcome
@@ -104,9 +106,16 @@ useEffect(() => {
       if (messageType === "human_in_loop_request") {
         setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []),  {"toolCallRequest": toolCallRequest , "type": messageType, "requestId": requestId, "requestCompleted": false, "agentId": agentId }]}))
       }
+      if (messageType === "human_input_request") {
+        // add to the relevant agent
+        // add a request_completed, only shows if not, and completion should update it, too
+        setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []),  {"humanInputRequest": humanInputRequest , "type": messageType, "requestId": requestId, "requestCompleted": false, "agentId": agentId }]}))
+      }
 
       if (messageType === "task_result") {
       setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []), { "content": agentResponse, "type": messageType} ]}))
+      } else if (messageType === "task_error") {
+        setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []), { content: eventParsed.agent_error, type: messageType }]}))
       } else if (messageType === "function_call") {
       setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []), { "content": agentResponse, "type": messageType, "functionName": eventParsed.function_name } ]}))
       } else if (messageType === 'client_side_tool_call') {
@@ -380,6 +389,17 @@ window.URL.revokeObjectURL(url);
 
                      }
 
+                     function handleHumanInputResponse(requestId) {
+
+                      // update react hook messages array
+                      setAgentMessages((agentMessages) => ({
+                        ...agentMessages,
+                        [agentId]: (agentMessages[agentId] ?? []).map(message => message.requestId === requestId ? {...message, "requestCompleted": true } : message)
+                      }))
+                      
+                     }
+
+
                      
 
                      // get and show the most recent message - so, text, function or result
@@ -387,8 +407,14 @@ window.URL.revokeObjectURL(url);
                      console.log("latestAgentTaskAnswer is: ", latestAgentTaskAnswer);
 
                      let answer = null;
+                     let taskError = null;
                      let files = null;
                      let functionUIVisual = null;
+                     let humanInputRequest = null;
+                     let humanInputRequestId = null;
+                     let humanInputRequestQuestion = null;
+                     let finalAnswerType = null;
+
 
                      // then, make choice by type
                      if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "task_result") {
@@ -396,12 +422,24 @@ window.URL.revokeObjectURL(url);
                       let convertedContent = JSON.parse(latestAgentTaskAnswer.content);
                       console.log("convertedContent is: ", convertedContent);
 
-                      answer = convertedContent?.answer;
+                      if (convertedContent.type === "final_answer") {
+                        finalAnswerType = "final_answer"
+                        answer = convertedContent?.answer
+                      } else {
+                        finalAnswerType = "custom_ui"
+                        answer = convertedContent
+                      }
+
+                      
+
+                      // here I need to find component, if answer is dynamic UI - or HTML/CSS iframe component needed
                   
                       if (convertedContent?.files) {
                         files = convertedContent.files;
                       }
 
+                     } else if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "task_error") {
+                      taskError = latestAgentTaskAnswer.content;
                      } else if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "function_call") {
                       // then show function call
                       // import different icon, dependent on name - need to return function name from backend
@@ -409,7 +447,14 @@ window.URL.revokeObjectURL(url);
                       functionUIVisual = functionUI[latestAgentTaskAnswer.functionName];
                       console.log("functionUIVisual chosen is: ", functionUIVisual);
                      
-                    } else {
+                    } else if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "human_input_request") {
+                       
+                      humanInputRequestId = latestAgentTaskAnswer.requestId; // it needs to be available, to mark right one to update
+                      humanInputRequest = latestAgentTaskAnswer
+                      humanInputRequestQuestion = latestAgentTaskAnswer.humanInputRequest
+                    }
+                    
+                    else {
                       answer = null;
                      files = null;
                      functionUIVisual = null;
@@ -438,9 +483,37 @@ window.URL.revokeObjectURL(url);
                       {latestHumanInLoopRequest && !latestHumanInLoopRequest.requestCompleted && (
                         <HumanInLoopModal latestHumanInLoopRequest={latestHumanInLoopRequest} handleHumanInLoopResponse={handleHumanInLoopResponse} />
                       )}
+
+                      {humanInputRequest && (
+                        <AskFurtherInformation {...{websocket: wsRef.current, agentId: agentId, requestCompleted: humanInputRequest.requestCompleted, onRequestCompletion: () => handleHumanInputResponse(humanInputRequestId), question: humanInputRequestQuestion }} />
+                      )}
+
     
-                      {answer && (
+                      {answer && finalAnswerType === "final_answer" && (
                         <p>Answer: {answer}</p>
+                      )}
+                      {answer && finalAnswerType === "custom_ui" && (
+                        <iframe  title="Agent response"
+    sandbox="allow-scripts"
+    srcDoc={`<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>${answer["css"] ?? ""}</style>
+  </head>
+  <body>${answer["html"] ?? ""}</body>
+  <script>${answer["js"] ?? ""}</script>
+</html>`}
+    style={{
+      width: "100%",
+      height: "500px",
+      border: "none",
+    }}/>
+                      )}
+
+                      {taskError && (
+                        <p role="alert" className="text-red-700">Error: {taskError}</p>
                       )}
                       { functionUIVisual && (
                         <>

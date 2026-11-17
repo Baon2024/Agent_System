@@ -68,15 +68,15 @@ async def run_agent(agent_id):
     try:
         agent = agents_state.get(agent_id)
         result = await agent.run(messages_memory, current_ws)
-        if current_ws:
+        if current_ws and result:
             await current_ws.send(json.dumps({"agent_id": agent_id,"agent_response": result, "message_type": "task_result" }))
-            agent.is_running = False
             print(f"run_number so far: {run_number}")
     except Exception as e:
         if current_ws:
             await current_ws.send(json.dumps({"agent_id": agent_id,"agent_error": str(e), "message_type": "task_error" }))
-            agent.is_running  = False
             print(f"run_number so far: {run_number}")
+    finally:
+        agent.is_running = False
 
 
 
@@ -127,9 +127,16 @@ async def handler(ws):
                 continue
             if frontend_tool_call:
                 ## must be result for frontend tool call
-                result = parsed_message["frontend_tool_call_result"]
-                frontend_tool_call_id = parsed_message["frontend_tool_call_id"]
-                frontend_tool_queue[frontend_tool_call_id].set_result(result) ## because existing value is intsance of asyncio.Future()
+                result = parsed_message.get("frontend_tool_call_result", None)
+                if result:
+                     frontend_tool_call_id = parsed_message["frontend_tool_call_id"]
+                     frontend_tool_queue[frontend_tool_call_id].set_result(result) ## because existing value is intsance of asyncio.Future()
+                else:
+                    error = parsed_message.get("error", None)
+                    if error:
+                        error_message = parsed_message.get("error_message")
+                        frontend_tool_call_id = parsed_message["frontend_tool_call_id"]
+                        frontend_tool_queue[frontend_tool_call_id].set_result(error_message)
             else:   
                 files = parsed_message.get('files', None)
                 if files:
@@ -149,6 +156,20 @@ async def handler(ws):
                     if current_agent.is_running == True:
                     # if agent exists, and is running - add message to existing run
                     ## when re-starting existing finished agent, probably need a intermediate message explaining to LLM?
+                        
+                        ## so, change the current_task_uuid fo the agent
+                        # current_agent.current_task_uuid
+                        # but only need to change it if actually a new task response..
+                        # so, should always change current_task_uuid to me whatever the user message's one is
+                        # but then need to make the previous aborted response's updates hidden, so only response from current one is seen?
+                        # the agent may or not still be working on the same underlying task
+                        # all this only neccessary once showing all messages
+                    ## or is that neccessary at all, as updates all shown in one seperate banner
+                    ## so even showing all the messages, could just shown actual confirmed user messages and agent final responses
+                    # filtering out all updates, by message_type, and keep latest update in seperate banner?
+
+
+
                         messages_memory.append(new_formatted_message)
                     else:
                     # if agent exists, not running - restart it

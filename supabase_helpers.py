@@ -31,4 +31,5 @@ async def save_file_to_supabase(file_path):
 
 async def get_supabase_public_path(storage_path):
     public_url = supabase.storage.from_(bucket).get_public_url(storage_path)
+    print(f"public_url inside of get_supabase_public_path is: {public_url}")
     return public_url

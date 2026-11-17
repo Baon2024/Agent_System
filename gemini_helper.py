@@ -12,10 +12,13 @@ from google.genai import types
 
 
 
-clientGemini = genai.Client()
+clientGemini = None
 
 
 def save_to_gemini(files):
+    global clientGemini
+    if clientGemini is None:
+        clientGemini = genai.Client()
     file_ids = []
     for file in files:
         public_url = file["publicUrl"]

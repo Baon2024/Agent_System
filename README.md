@@ -15,6 +15,13 @@ The system is designed around long-lived agent instances. Each agent is stored b
 - File and todo-list helper tools available to the agent.
 - Skill loading from the local `SKILLS` directory so the agent can read task-specific instructions.
 - Optional file upload and final-answer file handling through Gemini and Supabase helper paths.
+- Gemini inference cost estimates printed to the console and saved per call in `gemini_costs.json`, with a running GBP (£) total.
+
+## Gemini cost logging
+
+Both Gemini call sites in `agentVariant.py` call `save_gemini_cost(response.usage_metadata)` directly after inference. The function prints and saves input, cached, candidate, and thinking token counts and their costs to `gemini_costs.json`. Output totals combine candidate and thinking tokens without counting either twice.
+
+The function uses Gemini 3 Flash Preview standard paid-tier rates, checked on 2026-11-17: $0.50/M input tokens ($1.00/M audio), $0.05/M cached input ($0.10/M cached audio), and $3.00/M candidate and thinking tokens. See [Google's pricing](https://ai.google.dev/gemini-api/docs/pricing#gemini-3-flash-preview). Costs are converted to GBP using `USD_TO_GBP` in `gemini_costs.py`, set to 0.7584 on 2026-11-17 using [Wise](https://wise.com/gb/currency-converter/usd-to-gbp-rate/history/17-11-2026). This is a fixed exchange rate, not a live lookup; each entry records the rate used. These are token-cost estimates; free-tier usage, credits, and non-token charges may change actual billing. Update the rates if changing models or exchange rates.
 
 ## Tech Stack
 

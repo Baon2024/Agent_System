@@ -9,3 +9,6 @@ mcp
 fastmcp
 supabase
 python-frontmatter
+requests
+httpx
+ollama

@@ -4,10 +4,12 @@ import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
+from gemini_costs import save_gemini_cost
 
 
 
 load_dotenv()
+
 
 from typing import List, Optional, Literal
 from pydantic import BaseModel, Field, ConfigDict
@@ -593,7 +595,7 @@ from google.genai import types
 
 
 
-clientGemini = genai.Client()
+clientGemini = None
 
 
 
@@ -635,11 +637,23 @@ class FileDict(BaseModel):
     )  
 
 class FinalAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["final_answer"]
     answer: str = Field(
         ...,
         description="the final answer for the task."
     )
-    files: Optional[List[FileDict]]
+    files: Optional[List[FileDict]] = None
+
+
+class CustomUI(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["custom_ui"]
+    js: str = Field(description="JavaScript for allowing the user to interact with the component in the iframe")
+    html: str = Field(description="HTML markup for the component displayed in an iframe.")
+    css: str = Field(description="CSS styles for the HTML component.")
 
 import uuid
 
@@ -651,7 +665,7 @@ class LLMAgentResponse(BaseModel):
         description="1-2 sentence high-level reason for your next step. Do NOT reveal steps or chain-of-thought."
     )
 
-    # Can be None if final_answer exists
+    # Can be None when a result is ready.
     actions: Optional[List[Action]] = Field(
         default=None,
         description="the actions you want to take"
@@ -661,20 +675,17 @@ class LLMAgentResponse(BaseModel):
         description="the message_uuid that these actions or final message is in response to"
     )
 
-    # None if not ready, string if ready
-    final_answer: Optional[FinalAnswer] = Field(
+    result: FinalAnswer | CustomUI | None = Field(
         default=None,
-        description="the final answer to return if ready, otherwise None")
+        description="A final answer with optional files, or an HTML/CSS component. Null while using tools.")
 
     @model_validator(mode="after")
-    def _validate_actions_vs_final_answer(self) -> "ModelResponse":
-        # If we are ready to answer, actions may be None or empty.
-        if self.final_answer is not None:
-            return self
-
-        # Otherwise (final_answer is None), we must have at least one action.
-        if not self.actions or len(self.actions) == 0:
-            raise ValueError("actions must be a non-empty list when final_answer is null.")
+    def _validate_actions_vs_result(self) -> "LLMAgentResponse":
+        if self.result is not None:
+            if self.actions:
+                raise ValueError("Return actions or a result, not both.")
+        elif not self.actions:
+            raise ValueError("Provide actions when result is null.")
         return self
 
 
@@ -691,7 +702,11 @@ You are a tool-using assistant that works in a loop of (Rationale → Action →
 until you can provide a final answer.
 
 You can choose one, or multiple, or no functions or agents to call. if a function's params are None, then strictly return None
-If you choose to return final_answer, then "actions" should be empty.
+If you return a result, "actions" must be empty or null.
+Choose result.type="final_answer" for text with optional file attachments, or
+result.type="custom_ui" for a custom HTML/CSS component displayed in an iframe.
+For custom_ui, return the component markup in html and its styles in css.
+Return exactly one result type; do not mix answer/files with html/css.
 
 *NEVER PASS A *state* VALUE* - exclude it from the params you return (the state will be added automatically, you don't need to give it)
 
@@ -699,6 +714,7 @@ You can choose whether to create a "todo list" for more complex tasks. Your tool
 or edit it can be found under the *todo list functions* section. Any todo list you create should follow this pattern: use numbered point *(1), (2),* (for example)
 and each step should be marked as one of "pending" or "in-progress" or "done". Make sure to update the progress of all steps before returning your final answer.
 
+You can either return a final_answer with text and/or files, or a final answer which is custom UI via html/css. This gives you greater freedom to sovle the user's request.
 
 If you want to execute code, the best way is to write the code to a file (write_file function), and then run the file using run_python function, passing the filename
 
@@ -721,7 +737,8 @@ TOOL NAME RULES (IMPORTANT):
 - Never invent tool/agent names.
 - If you output an unknown name, your output is invalid.
 
-FINAL_ANSWER RULES (IMPORTANT):
+RESULT RULES (IMPORTANT):
+- Put completed output in result, using type="final_answer" or type="custom_ui".
 - files is an optional part you can return, if you created any files as part of the answer, which form part of the answer.
 - each file needs to be the file name
 
@@ -770,8 +787,8 @@ You can read a skill by calling the 'read_skill' function with the relative path
 
 Rules:
 - Keep "rationale" brief and non-enumerated (no step-by-step).
-- If you know the answer now, set "final_answer" and use "no_action" with empty input.
-- If you need to use a tool, set "action" to that tool and provide "action_input". Leave "final_answer" as null.
+- If you can finish now, populate "result" and leave "actions" null or empty.
+- If you need tools, populate "actions" with the tool calls and leave "result" null.
 - Never include additional keys. The entire message MUST be valid JSON.
 """.strip()
 
@@ -1023,14 +1040,58 @@ async def call_frontend_tool(tool_name, tool_args, frontend_tool_queue, ws, agen
     del frontend_tool_queue[frontend_tool_call_uuid]
     return response
 
+
+def ask_user_input(question: str):
+    """
+    This tool allows you to ask the user a question, which can be useful for clarifying their intent.
+
+    Input:
+      question: The question you would like to ask the user (str)
+    """
+
+    print(f"question: {question}")
+
+
   
 import inspect
 from datetime import datetime, timedelta
 import requests
+from pydantic import ValidationError
+
+def to_gemini_contents(messages):
+    contents = []
+            
+    for m in messages:
+        role = m["role"]
+        text = m["content"]
+                
+        if role == "system":
+        # Gemini expects system instructions via config, not in contents
+            continue
+                
+        parts = []
+        ## extract uploaded file, if it exists
+        files = m.get('files', None)
+        if files:
+            for file in files:
+                parts.append(                                                                                                               
+                    types.Part.from_uri(                                                                                                    
+                        file_uri=file.uri,                                                                                                     
+                        mime_type=file.mime_type,                                                                                              
+                        )                                                                                                                       
+                    )     
+                
+        parts.append(types.Part(text=text))
+        gem_role = "user" if role == "user" else "model"
+        contents.append(types.Content(role=gem_role, parts=parts))
+    return contents
 
 
 lock = asyncio.Lock()
 existing_timestamps = []
+
+from ollama import AsyncClient
+
 
 @dataclass
 class Agent:
@@ -1053,6 +1114,8 @@ class Agent:
         self.frontend_tool_queue = frontend_tool_queue
         self.agent_instance = agent_id # create uuid for the current agent, to be used when each agent writes to it's own folder
         self.final_answer_check = final_answer_check
+        self.model_provider = "" #"Ollama"
+        self.ollama_model = "qwen2.5:3b"
 
         final_system_prompt = passed_system_prompt
         
@@ -1201,12 +1264,39 @@ class Agent:
         self.tools_user_permission[function] = True
     
     async def check_final_answer(self, final_answer, user_request):
+        global clientGemini
+        provider = self.model_provider.lower()
+        if provider == "ollama":
+            
+
+            if final_answer.get("files"):
+                raise ValueError("Ollama final-answer checking currently supports text only; use Gemini to review attached files.")
+            
+            response = await AsyncClient().chat(
+                model=self.ollama_model,
+                messages=[
+                    {"role": "system", "content": (
+                        f"Current date: {date.today()}. Assess whether the final answer meets the user's request. "
+                        "Return JSON matching this schema: " + json.dumps(FinalAnswerCheck.model_json_schema())
+                    )},
+                    {"role": "user", "content": json.dumps({"user_request": user_request, "final_answer": final_answer})},
+                ],
+                format=FinalAnswerCheck.model_json_schema(),
+                options={"temperature": 0},
+                stream=False,
+            )
+            return FinalAnswerCheck.model_validate_json(response.message.content)
+
+        if clientGemini is None:
+            clientGemini = genai.Client()
+
         
         final_answer_files = final_answer.get("files", None)
 
         
         media_content = []
-        contents_text = types.Part(text=str(final_answer["answer"] + f"And user's request was: {user_request}")) ## this should be only text
+        result_text = final_answer.get("answer") if final_answer.get("type") == "final_answer" else json.dumps(final_answer)
+        contents_text = types.Part(text=f"Result: {result_text}\nUser's request: {user_request}")
         if final_answer_files:
             ## need to use supabase URLs to get info for LLM call
             print(f"final_answer_files exist: {final_answer_files}")
@@ -1231,16 +1321,17 @@ class Agent:
         """
         response = await asyncio.to_thread(
             clientGemini.models.generate_content,
-            model="gemini-3-flash-preview",
+            model="gemini-3.5-flash-lite",
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0,
                 system_instruction=system_text,
                 response_mime_type="application/json",
-                response_schema=FinalAnswerCheck # replace with new schema
+                response_json_schema=FinalAnswerCheck.model_json_schema()
             ),
         )
 
+        save_gemini_cost(response.usage_metadata)
         answer = response.parsed
         print(f"answer from check_final_answer is: {answer}")
         return answer
@@ -1249,6 +1340,9 @@ class Agent:
         ## LLM call to Gemini
     
     async def get_next_step(self, messages, agent_id): ## rename to execute?
+        global clientGemini
+        provider = self.model_provider.lower()
+
 
 
         ## get messages only for current agent instance
@@ -1283,36 +1377,9 @@ class Agent:
            # messages=self.messages,
             #response_format=LLMAgentResponse
         #)
-        def to_gemini_contents(messages):
-            contents = []
-            
-            for m in messages:
-                role = m["role"]
-                text = m["content"]
-                
-                if role == "system":
-                # Gemini expects system instructions via config, not in contents
-                    continue
-                
-                parts = []
-                ## extract uploaded file, if it exists
-                files = m.get('files', None)
-                if files:
-                    for file in files:
-                        parts.append(                                                                                                               
-                            types.Part.from_uri(                                                                                                    
-                            file_uri=file.uri,                                                                                                     
-                            mime_type=file.mime_type,                                                                                              
-                            )                                                                                                                       
-                        )     
-                
-                parts.append(types.Part(text=text))
-                gem_role = "user" if role == "user" else "model"
-                contents.append(types.Content(role=gem_role, parts=parts))
-            return contents
+        
 
         system_text = next(m["content"] for m in local_messages if m["role"] == "system")
-        contents = to_gemini_contents(local_messages)
         system_text += f"""Valid user requests for this agent:
         {json.dumps(valid_user_messages, indent=2)}
         When returning message_id, you MUST choose exactly one message_id from this list.
@@ -1324,42 +1391,77 @@ class Agent:
         
             for attempt in range(3):
 
-                await self.rate_limit()
+                if provider == "ollama":
 
+                    if any(message.get("files") for message in agent_messages):
+                        raise ValueError("Ollama agent messages currently support text only; use Gemini for uploaded files.")
+                    
+                    response = await AsyncClient().chat(
+                        model=self.ollama_model,
+                        messages=[{"role": "system", "content": system_text}] + [
+                            {"role": message["role"], "content": message["content"]}
+                            for message in agent_messages if message["role"] != "system"
+                        ],
+                        format=LLMAgentResponse.model_json_schema(),
+                        options={"temperature": 0},
+                        stream=False,
+                    )
+                    answer = response.message.content
+                else:
+                    await self.rate_limit()
+                    if clientGemini is None:
+                        clientGemini = genai.Client()
+                    response = await asyncio.to_thread(
+                        clientGemini.models.generate_content,
+                        model="gemini-3.5-flash-lite",
+                        contents=to_gemini_contents(local_messages),
+                        config=types.GenerateContentConfig(
+                            temperature=0,
+                            system_instruction=system_text,
+                            response_mime_type="application/json",
+                            response_json_schema=LLMAgentResponse.model_json_schema(),
+                        ),
+                    )
+                    save_gemini_cost(response.usage_metadata)
+                    answer = response.text
+                #filtered_answer = parse_first_json_object(answer)
+                try:
+                    formatted_answer_model = LLMAgentResponse.model_validate_json(answer)
+                except ValidationError as error:
+                    if attempt == 2:
+                        raise  # Final attempt: let your existing outer handler report it.
 
-                response = await asyncio.to_thread(
-                clientGemini.models.generate_content,
-                model="gemini-3-flash-preview",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    system_instruction=system_text,
-                    response_mime_type="application/json",
-                ),
-                )
-
-                answer = response.text
-                filtered_answer = parse_first_json_object(answer)
-                formatted_answer_model = LLMAgentResponse.model_validate(filtered_answer)
-                formatted_answer = formatted_answer_model.model_dump(mode="json")
+                    local_messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Your previous response failed validation:\n{error}\n\n"
+                            "Correct the problem in your next response. "
+                            "If an attachment does not exist, return an action to create "
+                            "it using write_file before returning a final answer."
+                        ),
+                    })
+                    continue
+                #formatted_answer = formatted_answer_model.model_dump(mode="json")
         
-                message_id = formatted_answer["message_id"]
+                message_id = str(formatted_answer_model.message_id) # because it's stripped of being a string when rteurned to frontend
                 if message_id not in valid_messages_id:
-                    system_text += f"message_id {message_id} is not a valid user message id, for a user request that you're actions or final_answer is responding to"
+                    system_text += f"message_id {message_id} is not a valid user message id for the request your actions or result respond to"
                     continue
                 formatted_answer_json = formatted_answer_model.model_dump_json()
-                print(f"formatted_answer is: {formatted_answer}")
-                messages.append({"role": "assistant", "content": formatted_answer_json, "agent_id": agent_id, "session_id": self.session_id })
-                return formatted_answer
+                print(f"formatted_answer is: {formatted_answer_model}")
+                messages.append({"role": "assistant", "content": formatted_answer_json, "agent_id": agent_id, "session_id": self.session_id, "message_id": message_id })
+                return formatted_answer_model.model_dump(mode="json")
+            ## JSON version used for adding to messages, non-json used for returning to be used in agent loop
         
             raise ValueError(
                 "LLM failed to return a valid message_id after 3 attempts. "
-                f"Last returned message_id: {message_id!r}. "
-                f"Valid message_ids: {sorted(valid_messages_id)!r}. "
-                f"Valid user messages: {valid_user_messages!r}. "
+                f"Last returned message_id: {message_id}. "
+                f"Valid message_ids: {sorted(valid_messages_id)}. "
+                f"Valid user messages: {valid_user_messages}. "
             )
         except Exception as e:
             print(f"Error occured: {e}")
+            raise
     
         #response: ChatResponse = chat(
            # model='qwen2.5:0.5b', 
@@ -1376,22 +1478,22 @@ class Agent:
         #print(f"completion.usage.total_tokens: {completion.usage.total_tokens}")
 
         #force it into pydantic model
-        obj = response["message"]["content"]
-        print(f"response obj is: {obj}")
+        #obj = response["message"]["content"]
+        #print(f"response obj is: {obj}")
         #obj["tokens_used"] = 1
 
-        step = LLMAgentResponse.model_validate(json.loads(obj))
+        #step = LLMAgentResponse.model_validate(json.loads(obj))
 
-        print(f"step response is: {step}")
-        step = step.model_dump()
+        #print(f"step response is: {step}")
+        #step = step.model_dump()
 
         #print(f"completion.usage.total_tokens: {completion.usage.total_tokens}")
         
         # Minimal validation
         
         
-        self.messages.append({"role": "assistant", "content": json.dumps(step)})
-        return step
+        #self.messages.append({"role": "assistant", "content": json.dumps(step)})
+        #return step
     
 
     async def run(self, messages_memory, current_ws):
@@ -1406,6 +1508,7 @@ class Agent:
 
         ## use current_ws to send updates to frontend
         agent_id = self.agent_instance # now derivered from internal state, instead of passed down
+        self.is_running = True
             
     
         for i in range(self.num_cycles):
@@ -1422,6 +1525,7 @@ class Agent:
             if step.get("actions"):
                 actions = step.get("actions", {})
                 actions_list = []
+                message_id = step["message_id"]
                 for i, action in enumerate(actions): ## all calls, whether sync or async, bust be awaited for my asyncio.Future() code to work
                     if action["type"] == "function":
                         print("function called by agent!")
@@ -1430,6 +1534,17 @@ class Agent:
                         args = action["params"]
                         human_in_loop_permission_required = action["human_in_loop_required"]
                         ## for mcp, check whether function name is in known_mcp_tools_for_agent
+                        ## if calling ask_user_input
+                        if function == "ask_user_input":
+                            # generate a request_id
+                            request_id = str(uuid.uuid4())
+                            question = args.get("question")
+                            # setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []),  {"humanInputRequest": humanInputRequest , "type": messageType, "requestId": requestId, "requestCompleted": false, "agentId": agentId }]}))
+                            await current_ws.send(json.dumps({"agent_id": agent_id,"human_input_request": question, "message_type": "human_input_request", "request_id": request_id }))
+                            self.is_running = False # so in loopVariant, it triggers teh right conditional
+                            return # in order to end current run
+
+
                         if function in self.known_mcp_tools_for_agent.keys():
                             print("--- function is in known_mcp_tools_for_agent - calling mcp path ---")
                             mcp_url = self.known_mcp_tools_for_agent[function]
@@ -1562,16 +1677,16 @@ class Agent:
                     #actions_list.append(result_message)
 
                 next_input = f"Observation from tool call/s: {actions_list}\n"
-                messages_memory.append({ "role": "assistant", "content": next_input, "agent_id": agent_id, "session_id": session_id })
+                messages_memory.append({ "role": "user", "content": next_input, "agent_id": agent_id, "session_id": session_id, "message_id": message_id })
             #local_state['todo_list'] = bot.review_todo_after_action(local_state['todo_list'], next_input)
         
             ## after tool call, just in case both tools and answer are provided - and to allow todo final update before answer
-            if step.get("final_answer"):
+            if step.get("result"):
             ## check files agent is returning, for each file add to supabase bucket, then create presignedurl
-                final_answer = step["final_answer"]
+                final_answer = step["result"]
 
                 ## use message_id, to find user question that final answer is response to
-                if final_answer.get('files'):
+                if final_answer["type"] == "final_answer" and final_answer.get('files'):
                     ## the agent is returning files it created for the task - upload to supabase, and get presigned url
                     print("--- file/s exist for the final_answer returned: will fetch public urls for each ---")
                     
@@ -1580,24 +1695,27 @@ class Agent:
                     for file in files:
                         local_path = file.get('file_path', None)
                         storage_path, mime_type = await save_file_to_supabase(local_path)
+                        print(f"storage_path: {storage_path}")
                         public_url = await get_supabase_public_path(storage_path)
+                        print(f"public_url: {public_url}")
                         file["file_path"] = public_url
                         file["mime_type"] = mime_type
                     print("final_answer before returning")
                 
-                ## make all this conditional on a 'final_answer_checker' == True in agent instantiation
+                if not self.final_answer_check:
+                    return json.dumps(final_answer)
+
                 message_id = step.get("message_id", None)
                 print(f"step message_id is: {step.get('message_id')}")
                 user_request = [message for message in messages_memory if message.get("agent_id") == self.agent_instance and message.get("message_id") == message_id and message.get("role") == "user"]
                 print(f"user_request in final_answer_checking workflow is: {user_request}")
                 final_answer_check = await self.check_final_answer(final_answer, user_request)
                 if final_answer_check.ready_to_return == True:
-                    return json.dumps(step["final_answer"])
+                    return json.dumps(final_answer)
                 else:
                     ## final_answer still needs improving
-                    actions_list.append(final_answer_check.explanation)
-                    next_input = f"Observation from tool call/s: {actions_list}\n"
-                    messages_memory.append({ "role": "assistant", "content": next_input, "agent_id": agent_id, "session_id": session_id })
+                    next_input = f"Final answer review feedback: {final_answer_check.explanation}\n"
+                    messages_memory.append({ "role": "user", "content": next_input, "agent_id": agent_id, "session_id": session_id, "message_id": message_id })
                 
                 ## call check_final_answer(), and get any files inside, and present to single Gemini call
 
@@ -1613,7 +1731,7 @@ class Agent:
         #then arse returned stuff inside that method, and take resonse here and udate todo list to equal that
 
     
-        return "Answer: (no answer within allotted cycles): tokens used:"
+        raise RuntimeError("The agent did not complete an answer within the allotted cycles.")
 
         # for core agent loop, just pull messages_memory from parent weboskcet loop eahc time? 
         
@@ -1632,7 +1750,8 @@ class Agent:
 
 async def get_new_agent(agent_id, frontend_tool_queue, agent_controller):
     
-        _agent = Agent(system_prompt_programatic_ollama, agent_id, "Main Agent", ollama_state, tools=[firecrawl_search, run_python, how_to_web_search, edit_todo_list, write_todo_list, read_todo_list, read_file, multiple_concurrent_sub_agents, write_file, read_folder_files, ask_user_followup, read_skill, get_user_location], mcp_urls=["http://127.0.0.1:8000/mcp"], frontend_tool_queue=frontend_tool_queue, agent_controller=agent_controller)
+        _agent = Agent(system_prompt_programatic_ollama, agent_id, "Main Agent", ollama_state, tools=[firecrawl_search, run_python, how_to_web_search, edit_todo_list, write_todo_list, read_todo_list, read_file, write_file, read_folder_files, ask_user_followup, read_skill, get_user_location, ask_user_input], mcp_urls=["http://127.0.0.1:8000/mcp"], frontend_tool_queue=frontend_tool_queue, agent_controller=agent_controller, final_answer_check=False)
+        ## add back in multiple_concurrent_sub_agents later
         print("_cached_agent created - running get_mcp_tools...")
         await _agent.get_mcp_tools()
         print("_cached_agent has fetched get_mcp_tools -  returning _cached_agent...")

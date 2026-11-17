@@ -20,3 +20,6 @@ export function get_user_location({ high_acccuracy = false } = {}) {
   });
 
 }
+
+
+// do all the tool declerations here, with the zod schemas
