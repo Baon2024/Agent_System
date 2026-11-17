@@ -18,7 +18,7 @@ export default function AskFurtherInformation({ websocket, agentId, requestCompl
 
         await websocket.send(JSON.stringify({ agent_id: agentId, user_message: userAnswer.trim(), message_id: messageId, message_type: "ask_further_information_response" }))
         setShowComponent(false);
-        onRequestCompletion()
+        onRequestCompletion(userAnswer.trim(), messageId)
     }
  
 

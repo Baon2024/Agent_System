@@ -1,9 +1,10 @@
 from pathlib import Path
 from supabase import create_client
 import mimetypes
+import os
 
-SUPABASE_URL = "https://xmcyvimeuarsivupecuv.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY= "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhtY3l2aW1ldWFyc2l2dXBlY3V2Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTczNjUzNjY5NywiZXhwIjoyMDUyMTEyNjk3fQ.S8lA3GEZdnWVzUExHSIl9qE1M72qiu40ITv7_oJGrbE"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from gemini_costs import save_gemini_cost
-
+import os
 
 
 load_dotenv()
@@ -37,7 +37,7 @@ class ToDoList(BaseModel):
 
 from firecrawl import Firecrawl
 
-firecrawl = Firecrawl(api_key="fc-3bcef77f2ef94ebfae02c9301e20ac30")
+firecrawl = Firecrawl(api_key=os.getenv("FIRECRAWL_API_KEY"))
 
 
 
@@ -50,12 +50,16 @@ def firecrawl_search(state, search: str, number_of_results: int = 3):
     
     """
 
-    results = firecrawl.search(
-        search,
-        limit=number_of_results
-    )
-    print(f"results from firecrawl are: {results}")
-    return { "results": results, "number_of_results": number_of_results}
+    try:
+        results = firecrawl.search(
+            search,
+            limit=number_of_results
+        )
+        print(f"results from firecrawl are: {results}")
+        return { "results": results, "number_of_results": number_of_results}
+    except Exception as e:
+        print(f"An error occured with the Firecrawl search for {search}: {e}")
+        return f"An error occured with the Firecrawl search for {search}: {e}"
 
 
 

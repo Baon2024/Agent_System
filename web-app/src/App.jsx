@@ -1,16 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "../supabase/supabase.js";
 import { get_user_location } from "../frontendTools/tools.js";
-import { HumanInLoopModal } from "../components/modal.jsx";
-import AskFurtherInformation from "../components/AskFurtherInformation.jsx";
-
-const functionUI = {
-  read_todo: "📝",
-  write_todo: "📝",
-  edit_todo_list: "📝",
-  }
-
-
+import AgentMessengerController from "../components/AgentMessengerController.jsx";
 
 export default function App() {
   const [agentIds, setAgentIds] = useState([]);
@@ -80,6 +71,15 @@ useEffect(() => {
         const toolName = eventParsed.tool_name
         const args = eventParsed.args ?? {}
         const frontendToolCallId = eventParsed.frontend_tool_call_uuid 
+        setAgentMessages((prev) => ({
+          ...prev,
+          [agentId]: [...(prev[agentId] ?? []), {
+            type: "client_side_tool_call",
+            functionName: toolName,
+            content: args,
+            requestId: frontendToolCallId,
+          }],
+        }));
 
         // then, use tool name to locate the function to call
         const chosenTool = clientSideTools[toolName];
@@ -226,18 +226,14 @@ useEffect(() => {
     const messageId = crypto.randomUUID()
 
     // check if the current agentId has any files attached, ready to be uploaded to supabase
-    if (agentTaskFiles[agentId]) {
+    if (agentTaskFiles[agentId]?.length) {
       console.log("agentTaskFiles exist for current user task request about to be triggered - will save to supabase and retrieved public urls..");
       const files = await supabaseSaveFile(agentId, agentTaskFiles[agentId]);
       socket.send(JSON.stringify({ agent_id: agentId, user_message: trimmedMessage, message_id: messageId, files: files  }));
       setAgentMessages((prev) => ({...prev, [agentId]: [...(prev[agentId] ?? []), { agent_id: agentId, user_message: trimmedMessage, type: "user_question_task", message_id: messageId, files: files }]}))
       // then wipe existing files, so they don't get re-sbubmitted next time
-      agentTaskFiles[agentId] = [];
-      setDraftMessages((draftMessagesClone) => {
-        let existing = draftMessagesClone
-        existing.agentId = ""
-        return existing
-      })
+      setAgentTaskFiles((prev) => ({ ...prev, [agentId]: [] }));
+      setDraftMessages((prev) => ({ ...prev, [agentId]: "" }));
     } else {
 
     socket.send(JSON.stringify({ agent_id: agentId, user_message: trimmedMessage, message_id: messageId }));
@@ -291,6 +287,48 @@ window.URL.revokeObjectURL(url);
     }));
   }
 
+  function handleHumanInLoopResponse(approval, request) {
+    const socket = wsRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      console.log("websocket is not connected");
+      return;
+    }
+
+    socket.send(JSON.stringify({
+      human_in_loop_response: true,
+      agent_id: request.agentId,
+      request_id: request.requestId,
+      result: approval,
+    }));
+    setAgentMessages((prev) => ({
+      ...prev,
+      [request.agentId]: (prev[request.agentId] ?? []).map((message) =>
+        message.requestId === request.requestId
+          ? { ...message, requestCompleted: true, approved: approval }
+          : message
+      ),
+    }));
+  }
+
+  function handleHumanInputResponse(agentId, requestId, answer, messageId) {
+    setAgentMessages((prev) => ({
+      ...prev,
+      [agentId]: [
+        ...(prev[agentId] ?? []).map((message) =>
+          message.requestId === requestId
+            ? { ...message, requestCompleted: true }
+            : message
+        ),
+        {
+          agent_id: agentId,
+          user_message: answer,
+          type: "user_question_task",
+          message_id: messageId,
+        },
+      ],
+    }));
+  }
+
   return (
     <main className="h-screen bg-slate-100 p-4 md:p-6">
       <section className="flex h-full w-full flex-col rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200 md:p-8">
@@ -315,9 +353,9 @@ window.URL.revokeObjectURL(url);
           </button>
         </div>
 
-        <div className="flex-1 overflow-auto pt-6">
+        <div className="min-h-0 flex-1 overflow-auto pt-6">
           {Array.isArray(agentIds) && agentIds.length > 0 ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4">
+            <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
               {agentIds.map((agentId) => {
 
                 const findCurrentAgentTask = agentMessages[agentId]
@@ -330,10 +368,10 @@ window.URL.revokeObjectURL(url);
                 return (
                 <article
                   key={agentId}
-                  className="relative flex min-h-[18rem] flex-col overflow-hidden rounded-xl border border-slate-200 bg-slate-50 p-5"
+                  className="relative flex h-[76vh] min-h-[40rem] min-w-0 flex-col gap-4 overflow-hidden rounded-xl border border-slate-200 bg-white p-4 md:p-5"
                 >
-                  <div className="flex items-start justify-between gap-4">
-                    <h2 className="text-lg font-semibold text-slate-900">
+                  <div className="flex shrink-0 flex-col items-start justify-between gap-2 sm:flex-row sm:gap-4">
+                    <h2 className="line-clamp-2 min-w-0 break-words text-lg font-semibold text-slate-900">
                       Task
                       {latestAgentTaskQuestion ? ` - ${latestAgentTaskQuestion}` : ""}
                     </h2>
@@ -342,204 +380,24 @@ window.URL.revokeObjectURL(url);
                     </span>
                   </div>
 
-                  {agentMessages[agentId] && (() => {
-                     
-                     //console.log("message inside of agentMessage[agentId] is: ", message);
-
-                     // need to retrieve the user's question sent - so it can be displayed as current question being answered
-                     // find latest messgae for this agentId, that is 'user_question_task'
-
-                     // see if any toolCallRequestExist and if requestCompleted is false
-                     // after user responds, send ws to backend, but also filter agentMessages[agentId]
-                     // to mark requestCompleted as true, so it no longer appears
-                     let humanInLoopRequestslist = agentMessages[agentId].filter((message) => message["type"] === "human_in_loop_request" && message["requestCompleted"] === false)
-                     // if multiple exist, get most last
-                     let latestHumanInLoopRequest = null;
-                     if (humanInLoopRequestslist.length > 0) {
-                      latestHumanInLoopRequest = humanInLoopRequestslist.at(-1)
-                     } else {
-                      latestHumanInLoopRequest = null
-                     }
-                     console.log("humanInLoopRequestList is: ", humanInLoopRequestslist);
-                     console.log("latestHumanInLoopRequest is: ", latestHumanInLoopRequest);
-                     // need to add in time sent, on backend, so i can reliably sort for latest in the future
-                     // latestHumanInLoopRequest["toolCalRequest"]
-
-                     // if latestHumanInLoopRequest exists, conditionally render JSX
-                     // and render toolCallRequest
-
-                     // function to handle response by user
-                     function handleHumanInLoopResponse(approval, request) {
-
-                      // update react hook messages array
-                      setAgentMessages((agentMessages) => ({
-                        ...agentMessages,
-                        [agentId]: (agentMessages[agentId] ?? []).map(message => message.requestId === request.requestId ? {...message, "requestCompleted": true } : message)
-                      }))
-                      // then send message back to backend, re-using requestId and agentId
-                      // need "human_in_loop_response" True, and result with True or False
-                      const socket = wsRef.current;
-
-                      if (!socket || socket.readyState !== WebSocket.OPEN) {
-                         console.log("websocket is not connected");
-                         return;
-                      }
-
-                      socket.send(JSON.stringify({"human_in_loop_response": true, "agent_id": request["agentId"], "request_id": request["requestId"], "result": approval }))
-
-                     }
-
-                     function handleHumanInputResponse(requestId) {
-
-                      // update react hook messages array
-                      setAgentMessages((agentMessages) => ({
-                        ...agentMessages,
-                        [agentId]: (agentMessages[agentId] ?? []).map(message => message.requestId === requestId ? {...message, "requestCompleted": true } : message)
-                      }))
-                      
-                     }
-
-
-                     
-
-                     // get and show the most recent message - so, text, function or result
-                     const latestAgentTaskAnswer = agentMessages[agentId] ? agentMessages[agentId].at(-1) : null;
-                     console.log("latestAgentTaskAnswer is: ", latestAgentTaskAnswer);
-
-                     let answer = null;
-                     let taskError = null;
-                     let files = null;
-                     let functionUIVisual = null;
-                     let humanInputRequest = null;
-                     let humanInputRequestId = null;
-                     let humanInputRequestQuestion = null;
-                     let finalAnswerType = null;
-
-
-                     // then, make choice by type
-                     if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "task_result") {
-
-                      let convertedContent = JSON.parse(latestAgentTaskAnswer.content);
-                      console.log("convertedContent is: ", convertedContent);
-
-                      if (convertedContent.type === "final_answer") {
-                        finalAnswerType = "final_answer"
-                        answer = convertedContent?.answer
-                      } else {
-                        finalAnswerType = "custom_ui"
-                        answer = convertedContent
-                      }
-
-                      
-
-                      // here I need to find component, if answer is dynamic UI - or HTML/CSS iframe component needed
-                  
-                      if (convertedContent?.files) {
-                        files = convertedContent.files;
-                      }
-
-                     } else if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "task_error") {
-                      taskError = latestAgentTaskAnswer.content;
-                     } else if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "function_call") {
-                      // then show function call
-                      // import different icon, dependent on name - need to return function name from backend
-                      // and have different conditional for skills, mcp calls
-                      functionUIVisual = functionUI[latestAgentTaskAnswer.functionName];
-                      console.log("functionUIVisual chosen is: ", functionUIVisual);
-                     
-                    } else if (latestAgentTaskAnswer && latestAgentTaskAnswer.type === "human_input_request") {
-                       
-                      humanInputRequestId = latestAgentTaskAnswer.requestId; // it needs to be available, to mark right one to update
-                      humanInputRequest = latestAgentTaskAnswer
-                      humanInputRequestQuestion = latestAgentTaskAnswer.humanInputRequest
-                    }
-                    
-                    else {
-                      answer = null;
-                     files = null;
-                     functionUIVisual = null;
-                    }
-
-                     /*const agentTaskAnswer = agentMessages[agentId].find((message) => message.type === "task_result");
-                     console.log("result from agent task exists: ", agentTaskAnswer);
-
-                     
-
-                     if (agentTaskAnswer) {
-                      let convertedContent = JSON.parse(agentTaskAnswer.content);
-                      console.log("convertedContent is: ", convertedContent);
-
-                      answer = convertedContent?.answer;
-                  
-                      if (convertedContent?.files) {
-                        files = convertedContent.files;
-                      }
-                     }*/
-
-                     // only return most recent message for display?
-                     // and only if it's the final response.
-                     return (
-                      <>
-                      {latestHumanInLoopRequest && !latestHumanInLoopRequest.requestCompleted && (
-                        <HumanInLoopModal latestHumanInLoopRequest={latestHumanInLoopRequest} handleHumanInLoopResponse={handleHumanInLoopResponse} />
-                      )}
-
-                      {humanInputRequest && (
-                        <AskFurtherInformation {...{websocket: wsRef.current, agentId: agentId, requestCompleted: humanInputRequest.requestCompleted, onRequestCompletion: () => handleHumanInputResponse(humanInputRequestId), question: humanInputRequestQuestion }} />
-                      )}
-
-    
-                      {answer && finalAnswerType === "final_answer" && (
-                        <p>Answer: {answer}</p>
-                      )}
-                      {answer && finalAnswerType === "custom_ui" && (
-                        <iframe  title="Agent response"
-    sandbox="allow-scripts"
-    srcDoc={`<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>${answer["css"] ?? ""}</style>
-  </head>
-  <body>${answer["html"] ?? ""}</body>
-  <script>${answer["js"] ?? ""}</script>
-</html>`}
-    style={{
-      width: "100%",
-      height: "500px",
-      border: "none",
-    }}/>
-                      )}
-
-                      {taskError && (
-                        <p role="alert" className="text-red-700">Error: {taskError}</p>
-                      )}
-                      { functionUIVisual && (
-                        <>
-                        <h3>{functionUIVisual} - {latestAgentTaskAnswer.functionName}</h3>
-                        </>
-                      )}
-                      {files && files.map((file, idx) => (
-                        <div key={idx}>
-                        <p>{file?.file_name ?? `file`}</p>
-                        <button onClick={()=> downloadFile(file?.file_path)}>download file</button>
-                        </div>
-                      ))}
-                      </>
-                     )
-                     
-                     
-                     })()}
+                  <AgentMessengerController
+                    agentId={agentId}
+                    messages={agentMessages[agentId] ?? []}
+                    websocket={wsRef.current}
+                    handleHumanInLoopResponse={handleHumanInLoopResponse}
+                    handleHumanInputResponse={handleHumanInputResponse}
+                    downloadFile={downloadFile}
+                  />
 
                   <textarea
                     value={draftMessages[agentId] ?? ""}
                     onChange={(event) => updateDraftMessage(agentId, event.target.value)}
                     placeholder="Enter a message for this agent"
-                    className="mt-4 min-h-32 flex-1 resize-none rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
+                    aria-label="Message this agent"
+                    className="h-24 shrink-0 resize-none rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-slate-400 focus:ring-2 focus:ring-slate-200"
                   />
 
-                  <div className="mt-4 flex items-center justify-between gap-3">
+                  <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
                     <div className="flex items-center gap-3">
                       <button
                         type="button"
